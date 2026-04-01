@@ -11,7 +11,8 @@ export default async function handler(req, res) {
     }
 
     // Twelve Data endpoints
-    const SPY_URL = `https://api.twelvedata.com/quote?symbol=SPY&apikey=${TWELVE_DATA_API_KEY}`;
+    const SPY_QUOTE_URL = `https://api.twelvedata.com/quote?symbol=SPY&apikey=${TWELVE_DATA_API_KEY}`;
+    const SPY_TS_URL = `https://api.twelvedata.com/time_series?symbol=SPY&interval=1h&outputsize=50&apikey=${TWELVE_DATA_API_KEY}`;
     const VIX_URL = `https://api.twelvedata.com/quote?symbol=VIX&apikey=${TWELVE_DATA_API_KEY}`;
 
     async function fetchJSON(url) {
@@ -26,26 +27,51 @@ export default async function handler(req, res) {
     }
 
     // Fetch data
-    const [spyData, vixData] = await Promise.all([
-      fetchJSON(SPY_URL),
+    const [spyQuote, spyCandlesData, vixData] = await Promise.all([
+      fetchJSON(SPY_QUOTE_URL),
+      fetchJSON(SPY_TS_URL),
       fetchJSON(VIX_URL)
     ]);
 
-    // Safety checks
-    if (!spyData || spyData.status === "error") {
-      throw new Error(`SPY data error: ${spyData?.message || "unknown"}`);
+    // Safety check
+    if (!spyQuote || spyQuote.status === "error") {
+      throw new Error(`SPY quote error: ${spyQuote?.message || "unknown"}`);
     }
 
-    const spyPrice = parseFloat(spyData.close);
-    const spyChange = parseFloat(spyData.percent_change);
-    const spyVolume = parseFloat(spyData.volume);
+    if (!spyCandlesData || spyCandlesData.status === "error") {
+      throw new Error(`SPY time series error: ${spyCandlesData?.message || "unknown"}`);
+    }
 
+    // Parse quote
+    const spyPrice = parseFloat(spyQuote.close);
+    const spyChange = parseFloat(spyQuote.percent_change);
+    const spyVolume = parseFloat(spyQuote.volume);
+
+    // Parse candles
+    const candles = spyCandlesData.values.map(item => ({
+      open: parseFloat(item.open),
+      high: parseFloat(item.high),
+      low: parseFloat(item.low),
+      close: parseFloat(item.close),
+      volume: parseFloat(item.volume)
+    }));
+
+    // ===== Volume Profile Integration =====
+    const { buildVolumeProfile } = await import('./volumeProfile.js');
+
+    const vp = buildVolumeProfile(candles, 30);
+
+    const pocPrice = vp?.poc?.price;
+    const hvnCount = vp?.hvn?.length || 0;
+    const lvnCount = vp?.lvn?.length || 0;
+
+    // VIX handling
     const vixPrice = vixData?.close ? parseFloat(vixData.close) : "N/A";
 
-    // Format
     const spyChangeFormatted =
       typeof spyChange === "number" ? spyChange.toFixed(2) : "N/A";
 
+    // Message
     const message = `
 📊 Market Update
 
@@ -53,6 +79,11 @@ SPY:
 Price: ${spyPrice}
 Change: ${spyChangeFormatted}%
 Volume: ${spyVolume}
+
+Volume Profile:
+POC: ${pocPrice}
+HVN Levels: ${hvnCount}
+LVN Levels: ${lvnCount}
 
 VIX:
 Price: ${vixPrice}
@@ -83,7 +114,8 @@ Price: ${vixPrice}
 
     return res.status(200).json({
       success: true,
-      telegram: telegramResult
+      telegram: telegramResult,
+      volumeProfile: vp
     });
 
   } catch (error) {
