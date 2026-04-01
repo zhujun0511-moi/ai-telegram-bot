@@ -2,71 +2,62 @@ export default async function handler(req, res) {
   try {
     const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
     const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID;
+    const TWELVE_DATA_API_KEY = process.env.TWELVE_DATA_API_KEY;
 
-    if (!TELEGRAM_BOT_TOKEN || !TELEGRAM_CHAT_ID) {
+    if (!TELEGRAM_BOT_TOKEN || !TELEGRAM_CHAT_ID || !TWELVE_DATA_API_KEY) {
       return res.status(500).json({
-        error: "Missing TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID"
+        error: "Missing environment variables"
       });
     }
 
-    // Yahoo Finance endpoints
-    const SPY_URL =
-      "https://query1.finance.yahoo.com/v7/finance/quote?symbols=SPY";
-    const VIX_URL =
-      "https://query1.finance.yahoo.com/v7/finance/quote?symbols=%5EVIX";
+    // Twelve Data endpoints
+    const SPY_URL = `https://api.twelvedata.com/quote?symbol=SPY&apikey=${TWELVE_DATA_API_KEY}`;
+    const VIX_URL = `https://api.twelvedata.com/quote?symbol=VIX&apikey=${TWELVE_DATA_API_KEY}`;
 
-    // Fetch function with safety
     async function fetchJSON(url) {
-  const response = await fetch(url, {
-    headers: {
-      "User-Agent":
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120 Safari/537.36",
-      "Accept": "application/json"
+      const response = await fetch(url);
+
+      if (!response.ok) {
+        const text = await response.text();
+        throw new Error(`HTTP error ${response.status}: ${text}`);
+      }
+
+      return await response.json();
     }
-  });
 
-  if (!response.ok) {
-    const text = await response.text();
-    throw new Error(`HTTP error ${response.status}: ${text}`);
-  }
-
-  return await response.json();
-}
-
-    // Fetch market data
+    // Fetch data
     const [spyData, vixData] = await Promise.all([
       fetchJSON(SPY_URL),
       fetchJSON(VIX_URL)
     ]);
 
-    // Safe extraction
-    const spy = spyData?.quoteResponse?.result?.[0];
-    const vix = vixData?.quoteResponse?.result?.[0];
-
-    if (!spy) {
-      throw new Error("SPY data unavailable");
+    // Safety checks
+    if (!spyData || spyData.status === "error") {
+      throw new Error(`SPY data error: ${spyData?.message || "unknown"}`);
     }
 
-    // Extract fields
-    const spyPrice = spy.regularMarketPrice;
-    const spyChange = spy.regularMarketChangePercent;
-    const spyVolume = spy.regularMarketVolume;
+    const spyPrice = parseFloat(spyData.close);
+    const spyChange = parseFloat(spyData.percent_change);
+    const spyVolume = parseFloat(spyData.volume);
 
-    const vixPrice = vix?.regularMarketPrice ?? "N/A";
+    const vixPrice = vixData?.close ? parseFloat(vixData.close) : "N/A";
 
-    // Format message
+    // Format
+    const spyChangeFormatted =
+      typeof spyChange === "number" ? spyChange.toFixed(2) : "N/A";
+
     const message = `
 📊 Market Update
 
 SPY:
 Price: ${spyPrice}
-Change: ${spyChange?.toFixed(2)}%
+Change: ${spyChangeFormatted}%
 Volume: ${spyVolume}
 
 VIX:
 Price: ${vixPrice}
 
-🧠 Sent from bot
+🧠 Twelve Data Feed
 `;
 
     // Send to Telegram
@@ -82,6 +73,11 @@ Price: ${vixPrice}
         text: message
       })
     });
+
+    if (!telegramResponse.ok) {
+      const text = await telegramResponse.text();
+      throw new Error(`Telegram error: ${text}`);
+    }
 
     const telegramResult = await telegramResponse.json();
 
