@@ -1,3 +1,5 @@
+import { analyzeMarketState } from './marketState.js';
+
 export default async function handler(req, res) {
   try {
     const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
@@ -10,7 +12,9 @@ export default async function handler(req, res) {
       });
     }
 
-    // Twelve Data endpoints
+    // -----------------------------
+    // Endpoints
+    // -----------------------------
     const SPY_QUOTE_URL = `https://api.twelvedata.com/quote?symbol=SPY&apikey=${TWELVE_DATA_API_KEY}`;
     const SPY_TS_URL = `https://api.twelvedata.com/time_series?symbol=SPY&interval=1h&outputsize=50&apikey=${TWELVE_DATA_API_KEY}`;
     const VIX_URL = `https://api.twelvedata.com/quote?symbol=VIX&apikey=${TWELVE_DATA_API_KEY}`;
@@ -26,14 +30,15 @@ export default async function handler(req, res) {
       return await response.json();
     }
 
+    // -----------------------------
     // Fetch data
+    // -----------------------------
     const [spyQuote, spyCandlesData, vixData] = await Promise.all([
       fetchJSON(SPY_QUOTE_URL),
       fetchJSON(SPY_TS_URL),
       fetchJSON(VIX_URL)
     ]);
 
-    // Safety check
     if (!spyQuote || spyQuote.status === "error") {
       throw new Error(`SPY quote error: ${spyQuote?.message || "unknown"}`);
     }
@@ -42,12 +47,16 @@ export default async function handler(req, res) {
       throw new Error(`SPY time series error: ${spyCandlesData?.message || "unknown"}`);
     }
 
+    // -----------------------------
     // Parse quote
+    // -----------------------------
     const spyPrice = parseFloat(spyQuote.close);
     const spyChange = parseFloat(spyQuote.percent_change);
     const spyVolume = parseFloat(spyQuote.volume);
 
+    // -----------------------------
     // Parse candles
+    // -----------------------------
     const candles = spyCandlesData.values.map(item => ({
       open: parseFloat(item.open),
       high: parseFloat(item.high),
@@ -56,7 +65,9 @@ export default async function handler(req, res) {
       volume: parseFloat(item.volume)
     }));
 
-    // ===== Volume Profile Integration =====
+    // -----------------------------
+    // Volume Profile
+    // -----------------------------
     const { buildVolumeProfile } = await import('./volumeProfile.js');
 
     const vp = buildVolumeProfile(candles, 30);
@@ -65,13 +76,25 @@ export default async function handler(req, res) {
     const hvnCount = vp?.hvn?.length || 0;
     const lvnCount = vp?.lvn?.length || 0;
 
-    // VIX handling
+    // -----------------------------
+    // Market State
+    // -----------------------------
+    const marketState = analyzeMarketState({
+      price: spyPrice,
+      volumeProfile: vp
+    });
+
+    // -----------------------------
+    // VIX
+    // -----------------------------
     const vixPrice = vixData?.close ? parseFloat(vixData.close) : "N/A";
 
     const spyChangeFormatted =
       typeof spyChange === "number" ? spyChange.toFixed(2) : "N/A";
 
+    // -----------------------------
     // Message
+    // -----------------------------
     const message = `
 📊 Market Update
 
@@ -85,13 +108,22 @@ POC: ${pocPrice}
 HVN Levels: ${hvnCount}
 LVN Levels: ${lvnCount}
 
+Market State:
+State: ${marketState.state}
+Bias: ${marketState.bias}
+Position: ${marketState.position}
+In HVN: ${marketState.inHVN}
+In LVN: ${marketState.inLVN}
+
 VIX:
 Price: ${vixPrice}
 
 🧠 Twelve Data Feed
 `;
 
-    // Send to Telegram
+    // -----------------------------
+    // Send Telegram
+    // -----------------------------
     const telegramUrl = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`;
 
     const telegramResponse = await fetch(telegramUrl, {
@@ -115,6 +147,7 @@ Price: ${vixPrice}
     return res.status(200).json({
       success: true,
       telegram: telegramResult,
+      marketState,
       volumeProfile: vp
     });
 
