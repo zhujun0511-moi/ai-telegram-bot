@@ -2,7 +2,7 @@
   "cron": [
     {
       "path": "/api/send",
-      "schedule": "*/5 * * * *"
+      "schedule": "28 13 * * *"
     }
   ]
 }
