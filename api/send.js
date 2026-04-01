@@ -17,12 +17,21 @@ export default async function handler(req, res) {
 
     // Fetch function with safety
     async function fetchJSON(url) {
-      const response = await fetch(url);
-      if (!response.ok) {
-        throw new Error(`HTTP error ${response.status}`);
-      }
-      return await response.json();
+  const response = await fetch(url, {
+    headers: {
+      "User-Agent":
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120 Safari/537.36",
+      "Accept": "application/json"
     }
+  });
+
+  if (!response.ok) {
+    const text = await response.text();
+    throw new Error(`HTTP error ${response.status}: ${text}`);
+  }
+
+  return await response.json();
+}
 
     // Fetch market data
     const [spyData, vixData] = await Promise.all([
