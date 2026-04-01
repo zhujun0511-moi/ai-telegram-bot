@@ -66,6 +66,8 @@ ${newsInput}
 You MUST base your analysis on the above information.
 Do NOT ignore them.
 
+If information is insufficient, you must say "信息不足".
+
 ${basePrompt}
 
 Final answer must be in Chinese.
@@ -90,7 +92,7 @@ Final answer must be in Chinese.
   });
 
   const aiData = await aiRes.json();
-  const text = aiData.choices[0].message.content;
+  const text = aiData.choices?.[0]?.message?.content || "AI未返回有效内容";
 
   // ✅ Step 5：发送到 Telegram
   await fetch(`https://api.telegram.org/bot${process.env.TELEGRAM_TOKEN}/sendMessage`, {
