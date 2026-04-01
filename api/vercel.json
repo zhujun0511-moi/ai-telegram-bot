@@ -1,8 +1,8 @@
 {
   "cron": [
     {
-      "path": "/api/send?type=morning",
-      "schedule": "*/5 * * * *"
+      "path": "/api/send",
+      "schedule": "28 14 * * *"
     }
   ]
 }
