@@ -78,6 +78,11 @@ CANARY_MAX_WALKBACK = 5
 TASK_NAME = "bc_verify_weekend"
 REPORT_TYPE = "bc_verify"     # 非 cfet_alert，走標準頻道
 
+# 2026-07-25 新增：數據品質修正 pass 的乾跑開關。
+# 預設 True＝只偵測+報告、不寫回（首輪安全）；核實報告後把 env VERIFY_REPAIR_DRY_RUN=false
+# （或改此預設）即開啟實際寫回。範圍僅 D/W，H 留給第三階段批次清理。
+REPAIR_DRY_RUN = os.getenv("VERIFY_REPAIR_DRY_RUN", "true").strip().lower() != "false"
+
 
 def _now_est() -> datetime:
     return datetime.now(EST_TZ)
@@ -231,11 +236,13 @@ class VerifyDB:
         limit = BARS_LIMIT.get(period, 500)
         doc = col.find_one({"ticker": ticker, "period": period})
         if doc:
-            existing   = doc.get("bars", [])
-            existing_t = {b["t"] for b in existing}
-            truly_new  = [b for b in new_bars if b["t"] not in existing_t]
-            merged     = sorted(truly_new + existing,
-                                key=lambda b: b["t"], reverse=True)[:limit]
+            existing = doc.get("bars", [])
+            # 2026-07-25 對齊 DC 止血：按 t 字典合併、同 t 新值覆蓋舊值（新贏），
+            # 避免補抓時把同 t 的新抓值當「已存在」丟棄（權威值被暫定值擋住）+ 不再製造重複。
+            by_t = {b["t"]: b for b in existing}
+            for b in new_bars:
+                by_t[b["t"]] = b
+            merged = sorted(by_t.values(), key=lambda b: b["t"], reverse=True)[:limit]
             col.update_one(
                 {"ticker": ticker, "period": period},
                 {"$set": {"bars": merged, "updated_at": _now_est()}},
@@ -247,6 +254,13 @@ class VerifyDB:
             "updated_at": _now_est(),
         })
         return "inserted"
+
+    def replace_bars(self, ticker: str, period: str, bars: List[dict]):
+        """整筆覆蓋 bars 陣列（數據品質修正 pass 專用，不走去重合併）。"""
+        self.stock_db[f"Bars_{ticker.upper()}"].update_one(
+            {"ticker": ticker.upper(), "period": period},
+            {"$set": {"bars": bars, "updated_at": _now_est()}},
+        )
 
     # ── verdict ──
     def get_verdict(self, ticker: str, period: str, target_date: str) -> Optional[str]:
@@ -452,6 +466,92 @@ def _check_ticker_period(db: VerifyDB, ticker: str,
 
 
 # ─────────────────────────────────────────────
+# 數據品質修正（2026-07-25 新增，DC 止血之外的安全網）
+# ─────────────────────────────────────────────
+
+def _normalize_dedup_bars(bars: List[dict], period: str):
+    """
+    純函式，無 I/O。只動 t 字串與重複筆，不改任何 OHLCV 數值。
+      1. 正規化時間戳：'T' → 空格；D/W 一律「日期 00:00:00」
+         （消 isoformat 'T' vs str 空格 的格式不統一）。
+      2. 同交易日(D)/同週(W)去重，保留權威筆：原始時刻 00:00:00（/range）
+         優先於 16:00:00（/prev 暫定，值可能是髒的，如 AMZN 低點/HBAN 量能）。
+    回傳 (new_bars 新在前, n_removed 去重掉幾筆, n_reformatted 幾筆 t 被改寫)。
+    """
+    if not bars:
+        return bars, 0, 0
+
+    def _norm_t(t) -> str:
+        s = str(t).replace("T", " ")
+        # D/W 都以「日期 00:00:00」為準（W bar 本來就是週一 00:00）
+        return s[:10] + " 00:00:00" if period in ("D", "W") else s
+
+    def _orig_time(t) -> str:
+        s = str(t).replace("T", " ")
+        return s[11:19] if len(s) >= 19 else ""
+
+    best = {}  # norm_t -> bar（原樣，t 稍後才改寫）
+    for b in bars:
+        nt = _norm_t(b.get("t", ""))
+        cur = best.get(nt)
+        if cur is None:
+            best[nt] = b
+        elif _orig_time(b.get("t", "")) == "00:00:00" and _orig_time(cur.get("t", "")) != "00:00:00":
+            best[nt] = b  # 偏好 /range 權威筆（00:00），取代 /prev 暫定筆（16:00）
+        # 其餘（同 00:00、或格式差異但值相同）：保留先出現的（新在前，較新）
+
+    n_removed = len(bars) - len(best)
+    n_reformatted = 0
+    out = []
+    for nt, b in best.items():
+        nb = dict(b)
+        if nb.get("t") != nt:
+            nb["t"] = nt
+            n_reformatted += 1
+        out.append(nb)
+    out.sort(key=lambda x: x["t"], reverse=True)
+    return out, n_removed, n_reformatted
+
+
+def _repair_bars_quality(db: "VerifyDB", all_tickers: List[str], start_mono: float) -> dict:
+    """
+    掃核心票 × [D,W]，用 _normalize_dedup_bars 偵測同交易日重複 / T-vs-空格格式。
+    REPAIR_DRY_RUN=True 只統計不寫回；False 才 replace_bars 實際寫回。
+    H 不在此範圍（第三階段）。受 MAX_JOB_SECONDS 約束、per-ticker try/except。
+    """
+    stat = {"scanned": 0, "dup_tickers": 0, "dups": 0,
+            "fmt_tickers": 0, "repaired": 0, "dry_run": REPAIR_DRY_RUN}
+    sample = []
+    for ticker in all_tickers:
+        if time.monotonic() - start_mono >= MAX_JOB_SECONDS:
+            _log("⏱️ 逼近時限，數據品質修正提前結束")
+            break
+        for period in ("D", "W"):
+            try:
+                bars = db.get_bars(ticker, period)
+                stat["scanned"] += 1
+                if not bars:
+                    continue
+                new_bars, n_removed, n_fmt = _normalize_dedup_bars(bars, period)
+                if n_removed == 0 and n_fmt == 0:
+                    continue
+                if n_removed > 0:
+                    stat["dup_tickers"] += 1
+                    stat["dups"] += n_removed
+                    if len(sample) < 10:
+                        sample.append(f"{ticker}/{period}(-{n_removed})")
+                if n_fmt > 0:
+                    stat["fmt_tickers"] += 1
+                if not REPAIR_DRY_RUN:
+                    db.replace_bars(ticker, period, new_bars)
+                    stat["repaired"] += 1
+            except Exception as e:
+                _log(f"  ⚠️ 數據品質修正異常 ({ticker}/{period}): {e}")
+    stat["sample"] = sample
+    return stat
+
+
+# ─────────────────────────────────────────────
 # 金絲雀：目標日休市偵測 + 回退
 # ─────────────────────────────────────────────
 
@@ -588,6 +688,15 @@ def main() -> int:
                 window_processed = 0
                 window_blocked   = 0
 
+        # ── 數據品質修正 pass（2026-07-25 新增，同交易日重複 / T-vs-空格格式）──
+        _log("=== 數據品質修正開始 ===")
+        quality = _repair_bars_quality(db, all_tickers, start_mono)
+        _mode = "偵測(dry-run，未寫回)" if quality["dry_run"] else "已修正寫回"
+        _log(f"  數據品質[{_mode}] | 掃描 {quality['scanned']} | "
+             f"含重複 {quality['dup_tickers']}支/{quality['dups']}筆 | "
+             f"含格式問題 {quality['fmt_tickers']}支 | 實際寫回 {quality['repaired']}"
+             + (f" | 樣本 {', '.join(quality['sample'])}" if quality.get("sample") else ""))
+
         # ── Ticker 身份核對（Ticker_Identity，v1.1 新增，週六BC專屬低頻任務）──
         _log("=== Ticker 身份核對開始 ===")
         identity_fetched = 0
@@ -634,6 +743,12 @@ def main() -> int:
             f"檢查點 {total_points} | 達標 {counts['filled']} | "
             f"確認空 {counts['confirmed_empty']} | blocked {counts['blocked']}\n"
             f"本次補抓 {fetched} | 耗時 {elapsed:.1f} 分鐘"
+        )
+        _qmode = "偵測(dry-run)" if quality["dry_run"] else "已修正"
+        summary += (
+            f"\n🧹 數據品質[{_qmode}]：重複 {quality['dup_tickers']}支/"
+            f"{quality['dups']}筆、格式 {quality['fmt_tickers']}支"
+            + (f"、寫回 {quality['repaired']}支" if not quality["dry_run"] else "")
         )
         if suspected_reuse:
             reuse_list = ", ".join(f"{t}/{p}" for t, p, _, _ in suspected_reuse[:10])
