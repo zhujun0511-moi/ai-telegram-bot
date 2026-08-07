@@ -89,16 +89,24 @@ def _td_keys():
 
 class TDClient:
     """TD 抓取 + 雙 key 輪替 + 節流。free tier: 8 req/min、~800 credits/day/key。"""
-    def __init__(self, req_interval_s=8.0):
+    def __init__(self, req_interval_s=8.0, credits_per_min_per_key=7.0):
         self.keys = _td_keys()
         self.ki = 0
-        self.req_interval = req_interval_s
+        self.req_interval = req_interval_s            # 全域間隔下限（保底）
+        self.cpm_per_key = credits_per_min_per_key    # 每 key 每分鐘 credit 上限（免費層硬限 8，留 margin 用 7）
         self._last = 0.0
 
-    def _throttle(self):
+    def _throttle(self, n_symbols=1):
+        # ⚠️ TD 批次每個 symbol 算 1 credit → 一次請求耗 n_symbols credits（原節流誤設每請求 1 credit，
+        #    BATCH=8 時 8 秒吃 8 credits → 撞免費層「8 credits/分鐘」，見 DANGER_ZONES）。
+        # 守「每 key ≤ cpm_per_key credits/分鐘」：單 key 最小間隔 = n_symbols/cpm_per_key 分鐘；
+        # k 把 key 主動 round-robin 均攤 → 全域間隔可再 ÷k。取與保底下限較大者。
+        k = max(1, len(self.keys))
+        need = (n_symbols * 60.0 / self.cpm_per_key) / k
+        interval = max(self.req_interval, need)
         dt = time.time() - self._last
-        if dt < self.req_interval:
-            time.sleep(self.req_interval - dt)
+        if dt < interval:
+            time.sleep(interval - dt)
         self._last = time.time()
 
     def fetch(self, symbols, interval, outputsize=None, start_date=None, end_date=None,
@@ -108,6 +116,10 @@ class TDClient:
         回傳 { SYMBOL: {'status':'ok','values':[{datetime,open,high,low,close,volume},...]} }。
         （單票時 TD 回傳扁平，這裡正規化成同樣的 dict）
         """
+        if not symbols:
+            return {}
+        # 主動 round-robin：每次 fetch 換下一把 key，讓多把 key 均攤（反應式「撞限流才換」會讓單 key 先過載）
+        self.ki = (self.ki + 1) % len(self.keys)
         sym_str = ",".join(symbols)
         params = {"symbol": sym_str, "interval": interval, "apikey": self.keys[self.ki]}
         if outputsize is not None:
@@ -118,7 +130,7 @@ class TDClient:
             params["end_date"] = end_date
         last_err = None
         for attempt in range(retries):
-            self._throttle()
+            self._throttle(len(symbols))
             try:
                 r = requests.get(TD_URL, params=params, timeout=30)
                 data = r.json()
