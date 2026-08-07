@@ -29,7 +29,7 @@ concurrency:
 jobs:
   migrate:
     runs-on: ubuntu-latest
-    timeout-minutes: 120
+    timeout-minutes: 180   # 單 key 全量 D+H ~98-105 分鐘（BC 不加 TD2，見 handoff 2026-08-07）→ 放寬留重試餘裕
     env:
       MONGO_URI:      ${{ secrets.MONGO_URI }}
       TWELVE_KEY:     ${{ secrets.TWELVE_KEY }}
