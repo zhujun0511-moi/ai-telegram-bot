@@ -106,6 +106,7 @@ from huggingface_hub import HfApi
 from pymongo.errors import DuplicateKeyError
 
 from tasks.outbound import notify as _notify_shared, dispatch_workflow
+from bc_secutil import scrub
 
 FETCH_WORKFLOW_FILE   = "bc_poly_fetch.yml"
 COMPARE_WORKFLOW_FILE = "bc_poly_compare.yml"
@@ -349,7 +350,8 @@ def _fetch_polygon_daily(ticker: str, start_date: str, end_date: str):
             return None
         return body.get("results", []) or []
     except Exception as e:
-        _log(f"  ❌ [{ticker}] Polygon呼叫異常: {e}")
+        # ⚠️ scrub：requests 連線例外的 str(e) 會帶出含 apiKey 的 Polygon URL（見 bc_secutil / DANGER_ZONES §5）
+        _log(f"  ❌ [{ticker}] Polygon呼叫異常: {scrub(e)}")
         return None
 
 

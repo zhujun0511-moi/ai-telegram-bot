@@ -27,6 +27,8 @@ import time
 
 import requests
 
+from bc_secutil import scrub
+
 
 def notify(msg: str, report_type: str = "bc_backtest", retries: int = 1, delay: int = 2) -> bool:
     """
@@ -38,6 +40,10 @@ def notify(msg: str, report_type: str = "bc_backtest", retries: int = 1, delay: 
     間隔的較強韌版本，呼叫時傳 retries=3 保留原行為，不強迫統一成同一種
     重試策略（那是連續失敗告警用的，值得更韌一點）。
     """
+    # 2026-08-06 全域密鑰遮蔽（防禦縱深）：msg 可能帶呼叫端傳進的例外訊息，例外的
+    # str(e) 可能含密鑰 URL；在唯一對外 Telegram 出口統一遮蔽，保護所有 notify 呼叫端。
+    msg = scrub(msg)
+
     base           = os.getenv("COMM_HUB_URL", "").strip().rstrip("/")
     webhook_secret = os.getenv("WEBHOOK_SECRET", "").strip()
     if not base:
@@ -55,7 +61,7 @@ def notify(msg: str, report_type: str = "bc_backtest", retries: int = 1, delay: 
             if resp.status_code == 200:
                 return True
         except Exception as e:
-            print(f"[notify] 推送失敗（第{attempt + 1}次）: {e}")
+            print(f"[notify] 推送失敗（第{attempt + 1}次）: {scrub(e)}")
         if attempt < retries - 1:
             time.sleep(delay)
     return False
@@ -100,7 +106,7 @@ def dispatch_workflow(workflow_file: str, token: str = None, repo: str = None,
         print(f"→ dispatch {repo}/{workflow_file}: {resp.status_code}")
         return resp.status_code == 204
     except Exception as e:
-        print(f"❌ [dispatch] {workflow_file} 異常: {e}")
+        print(f"❌ [dispatch] {workflow_file} 異常: {scrub(e)}")
         return False
 
 
@@ -139,5 +145,5 @@ def trigger_ac_webhook(path: str, payload: dict) -> bool:
         print(f"[trigger_ac_webhook] {path}: {resp.status_code}")
         return resp.status_code < 400
     except Exception as e:
-        print(f"[trigger_ac_webhook] {path} 失敗: {e}")
+        print(f"[trigger_ac_webhook] {path} 失敗: {scrub(e)}")
         return False

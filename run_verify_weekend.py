@@ -54,6 +54,7 @@ from pymongo.errors import DuplicateKeyError
 from tasks.outbound import notify as _notify_shared
 from tasks.outbound import dispatch_next_workflow as _dispatch_next_workflow_shared
 from tasks.outbound import trigger_ac_webhook as _trigger_ac_webhook_shared
+from bc_secutil import scrub
 
 EST_TZ = pytz.timezone("US/Eastern")
 
@@ -404,7 +405,8 @@ def _fetch_polygon(ticker: str, period_label: str,
                 })
             return processed
         except Exception as e:
-            _log(f"  ❌ Polygon 連線異常 ({ticker}/{period_label}): {e}")
+            # ⚠️ scrub：requests 連線例外的 str(e) 會帶出含 apiKey 的 Polygon URL（見 bc_secutil / DANGER_ZONES §5）
+            _log(f"  ❌ Polygon 連線異常 ({ticker}/{period_label}): {scrub(e)}")
             if attempt == POLYGON_MAX_RETRY - 1:
                 return None
             time.sleep(POLYGON_WAIT)
@@ -440,7 +442,7 @@ def _fetch_polygon_reference(ticker: str) -> Optional[dict]:
             "company_name": data.get("name"),
         }
     except Exception as e:
-        _log(f"  ❌ [{ticker}] Reference API 連線異常: {e}")
+        _log(f"  ❌ [{ticker}] Reference API 連線異常: {scrub(e)}")
         return None
 
 
@@ -461,7 +463,7 @@ def _check_ticker_period(db: VerifyDB, ticker: str,
             return _get_week_monday(last_date) == _get_week_monday(target_date)
         return False
     except Exception as e:
-        _log(f"  ⚠️ _check_ticker_period 異常 ({ticker}/{period}): {e}")
+        _log(f"  ⚠️ _check_ticker_period 異常 ({ticker}/{period}): {scrub(e)}")
         return False
 
 
