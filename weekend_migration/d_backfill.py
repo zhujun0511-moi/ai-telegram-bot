@@ -17,6 +17,7 @@ import os, sys, io, argparse, datetime
 
 sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8")
 import mig_common as mc
+import bar_validator as bv
 
 BARS_LIMIT_D = 1100        # 對齊 DC config.py:42
 FETCH_OUTPUTSIZE = 1200    # 略多於 cap；TD 連續調整與窗口大小無關，1200 已足填滿 1100
@@ -49,16 +50,39 @@ def main():
     elif args.limit:
         tickers = tickers[:args.limit]
     mode = "WRITE(覆蓋)" if args.write else "DRY-RUN(只算不寫)"
+
+    # identity 票排除：severe（SPCX/LUNR 式）交 identity_cleanup.py 專職清理；
+    # mild（LAC/QBTS 式價格連續重組）保留現狀不覆蓋（TD 會丟掉 list_date 前歷史）。
+    cal = mc.load_calendar(sd)
+    ident = mc.load_identity_map(sd)
+    expect_latest = args.cutoff_date or mc.completed_trading_date(cal)
+    id_skip = []
+    for tk in tickers:
+        ld = ident.get(tk.upper())
+        if not ld:
+            continue
+        existing = (sd[f"Bars_{tk}"].find_one({"period": "D"}) or {}).get("bars", [])
+        sev = mc.identity_severity(existing, ld, cal)
+        if sev:
+            id_skip.append((tk, sev))
+    if id_skip:
+        skip_set = {t for t, _ in id_skip}
+        tickers = [t for t in tickers if t not in skip_set]
+        print(f"[d_backfill] 排除 {len(id_skip)} 支 identity 票（severe→identity_cleanup、mild→保留現狀）: {id_skip}")
+
     print(f"[d_backfill] {mode} | {len(tickers)} 支 | cutoff={args.cutoff_date or '(無,週末安全)'} | cap={BARS_LIMIT_D}")
 
     td = mc.TDClient()
     ok = fail = skipped = fixed = 0
+    outcomes = [{"ticker": t, "action": "kept" if s == "mild" else "archived_elsewhere"}
+                for t, s in id_skip]  # identity 排除也記進 log
     for batch in mc.batched(tickers, BATCH):
         res = td.fetch(batch, "1day", outputsize=FETCH_OUTPUTSIZE)
         for tk in batch:
             r = res.get(tk, {})
             if r.get("status") != "ok" or not r.get("values"):
                 fail += 1
+                outcomes.append({"ticker": tk, "action": "skipped", "codes": ["td_no_data"]})
                 print(f"  ❌ {tk}: TD 無資料（status={r.get('status')} msg={r.get('message','')[:60]}）→ 跳過不清空")
                 continue
             bars = mc.td_values_to_bars(r["values"], "D")   # 新在前
@@ -67,7 +91,19 @@ def main():
             bars = bars[:BARS_LIMIT_D]
             if len(bars) < 20:
                 fail += 1
+                outcomes.append({"ticker": tk, "action": "skipped", "codes": ["too_few_bars"]})
                 print(f"  ❌ {tk}: 解析後僅 {len(bars)} 根 → 跳過")
+                continue
+            # bar_validator 寫入閘門：新 TD bars 過驗才覆蓋（結構/OHLC/未來/身份硬擋；
+            # 大跳幅/深歷史 calendar_gap 只警告不擋——TD 連續調整可信）
+            gv = bv.validate(bars, {"period": "D", "operation": "historical_backfill",
+                                    "expect_latest": expect_latest, "calendar": cal,
+                                    "list_date": ident.get(tk.upper())})
+            blk = bv.blocking_fails(gv)
+            if blk:
+                fail += 1
+                outcomes.append({"ticker": tk, "action": "blocked", "codes": [x["code"] for x in blk]})
+                print(f"  ❌ {tk}: 閘門擋下 {[x['code'] for x in blk]} → 跳過不覆蓋")
                 continue
             # 分割修復偵測：舊 vs 新的最大跳變
             old_doc = sd[f"Bars_{tk}"].find_one({"period": "D"}) or {}
@@ -85,9 +121,18 @@ def main():
                               "updated_at": datetime.datetime.now(datetime.timezone.utc)}},
                     upsert=True)
             ok += 1
+            oc = {"ticker": tk, "action": "replaced", "latest": bars[0]["t"][:10]}
+            if fix_note:
+                oc["codes"] = ["split_fixed"]
+            outcomes.append(oc)
             print(f"  ✅ {tk}: {len(bars)}根 [{bars[-1]['t'][:10]}~{bars[0]['t'][:10]}] "
                   f"最新close={bars[0]['c']:.2f}{fix_note}")
     print(f"\n[d_backfill] {mode} 完成 | 成功 {ok} | 失敗/跳過 {fail} | 偵測修分割 {fixed}")
+    # log 制度：寫一筆 Validation_Log（供以後再抓時參照）
+    mc.write_validation_log(sd, context="migration_d", period="D", operation="historical_backfill",
+                            scope={"n_tickers": len(tickers) + len(id_skip), "expect_latest": expect_latest,
+                                   "ok": ok, "fail": fail, "fixed": fixed},
+                            outcomes=outcomes, write=args.write)
     if not args.write:
         print("[d_backfill] （這是 dry-run，未寫任何資料；確認無誤後加 --write）")
     cli.close()

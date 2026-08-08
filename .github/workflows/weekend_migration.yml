@@ -18,7 +18,11 @@ on:
         required: false
         default: ""
       tickers:
-        description: "逗號分隔指定票（測試用；留空=全部 342）"
+        description: "H+W 範圍逗號分隔（測試用；留空=全部 342）。identity 票由腳本自動排除/專職清理"
+        required: false
+        default: ""
+      d_tickers:
+        description: "D 範圍逗號分隔（外科式補遷移只填缺口票；留空=同 tickers）。省額度：D 只補缺、H 全量"
         required: false
         default: ""
 
@@ -31,9 +35,11 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 180   # 單 key 全量 D+H ~98-105 分鐘（BC 不加 TD2，見 handoff 2026-08-07）→ 放寬留重試餘裕
     env:
-      MONGO_URI:      ${{ secrets.MONGO_URI }}
-      TWELVE_KEY:     ${{ secrets.TWELVE_KEY }}
-      TWELVE_KEY_2:   ${{ secrets.TWELVE_KEY_2 }}
+      MONGO_URI:         ${{ secrets.MONGO_URI }}
+      TWELVE_KEY:        ${{ secrets.TWELVE_KEY }}
+      TWELVE_KEY_2:      ${{ secrets.TWELVE_KEY_2 }}
+      ANALYSIS_HUB_URL:  ${{ secrets.ANALYSIS_HUB_URL }}   # identity 灰色地帶 AI 判疑走 BC→AC
+      WEBHOOK_SECRET:    ${{ secrets.WEBHOOK_SECRET }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -55,10 +61,14 @@ jobs:
           [ -n "${{ inputs.cutoff_date }}" ] && CUTOFF="--cutoff-date ${{ inputs.cutoff_date }}"
           TKS=""
           [ -n "${{ inputs.tickers }}" ] && TKS="--tickers ${{ inputs.tickers }}"
+          # D 範圍：d_tickers 優先（外科式只補缺）；留空則沿用 tickers
+          DTKS="$TKS"
+          [ -n "${{ inputs.d_tickers }}" ] && DTKS="--tickers ${{ inputs.d_tickers }}"
           echo "write_flag=$WRITE_FLAG"  >> "$GITHUB_OUTPUT"
           echo "cutoff=$CUTOFF"          >> "$GITHUB_OUTPUT"
           echo "tks=$TKS"                >> "$GITHUB_OUTPUT"
-          echo "模式: write='${{ inputs.write }}' cutoff='${{ inputs.cutoff_date }}' tickers='${{ inputs.tickers }}'"
+          echo "dtks=$DTKS"              >> "$GITHUB_OUTPUT"
+          echo "模式: write='${{ inputs.write }}' cutoff='${{ inputs.cutoff_date }}' tickers='${{ inputs.tickers }}' d_tickers='${{ inputs.d_tickers }}'"
 
       # 0. 備份（永遠執行，覆蓋前的保險；上傳成 artifact）
       - name: Step 0 — Backup Bars_D/H
@@ -72,10 +82,16 @@ jobs:
           path: weekend_migration/backup_*/
           retention-days: 30
 
-      # 1. D backfill（TD 連續調整）
+      # 0.5 identity 清理（SPCX 式 ticker 回收重用）：封存舊實體 + 乾淨新實體 REPLACE。
+      #     全庫掃、bar_validator 判 severe（不硬編 ticker）；d/h_backfill 會自動排除這些票。
+      - name: Step 0.5 — Identity cleanup (severe reuse)
+        working-directory: weekend_migration
+        run: python -u identity_cleanup.py ${{ steps.args.outputs.write_flag }}
+
+      # 1. D backfill（TD 連續調整；bar_validator 閘門 + 自動排除 identity 票）
       - name: Step 1 — D backfill
         working-directory: weekend_migration
-        run: python -u d_backfill.py ${{ steps.args.outputs.write_flag }} ${{ steps.args.outputs.cutoff }} ${{ steps.args.outputs.tks }}
+        run: python -u d_backfill.py ${{ steps.args.outputs.write_flag }} ${{ steps.args.outputs.cutoff }} ${{ steps.args.outputs.dtks }}
 
       # 2. H backfill（TD 30m RTH）
       - name: Step 2 — H backfill
