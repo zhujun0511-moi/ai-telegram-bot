@@ -216,7 +216,7 @@ class VerifyDB:
     # ── bars 讀寫（語義克隆自 DC database.py）──
     def get_bars(self, ticker: str, period: str) -> List[dict]:
         ticker = ticker.upper()
-        doc = self.stock_db[f"Bars_{ticker}"].find_one(
+        doc = self.stock_db["Bars"].find_one(
             {"ticker": ticker, "period": period})
         if doc and "bars" in doc:
             return doc["bars"]
@@ -229,7 +229,7 @@ class VerifyDB:
         防止補抓中段缺口時破壞排序（DC 版假設 new 恆比 existing 新）。
         """
         ticker = ticker.upper()
-        col = self.stock_db[f"Bars_{ticker}"]
+        col = self.stock_db["Bars"]
         col.create_index(
             [("ticker", pymongo.ASCENDING), ("period", pymongo.ASCENDING)],
             unique=True,
@@ -258,7 +258,7 @@ class VerifyDB:
 
     def replace_bars(self, ticker: str, period: str, bars: List[dict]):
         """整筆覆蓋 bars 陣列（數據品質修正 pass 專用，不走去重合併）。"""
-        self.stock_db[f"Bars_{ticker.upper()}"].update_one(
+        self.stock_db["Bars"].update_one(
             {"ticker": ticker.upper(), "period": period},
             {"$set": {"bars": bars, "updated_at": _now_est()}},
         )

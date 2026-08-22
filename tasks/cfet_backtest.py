@@ -165,7 +165,7 @@ class BacktestDB:
         bars 新在前排序，與數據中心一致。
         """
         ticker = ticker.upper()
-        col    = self.stock_db[f"Bars_{ticker}"]
+        col    = self.stock_db["Bars"]
         doc    = col.find_one({"ticker": ticker, "period": period})
         if not doc or "bars" not in doc:
             return []
