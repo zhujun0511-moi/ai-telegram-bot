@@ -56,6 +56,10 @@ from tasks.outbound import dispatch_next_workflow as _dispatch_next_workflow_sha
 from tasks.outbound import trigger_ac_webhook as _trigger_ac_webhook_shared
 from bc_secutil import scrub
 
+# DAL 統一數據存取純核心（2026-08-23 vendored 自 DC canonical，逐字同步 + checksum audit）。
+# BC verify 的 Bars 讀寫走 data_core（get_bars/push_bars/replace_bars）。
+import data_core as dc
+
 EST_TZ = pytz.timezone("US/Eastern")
 
 MONGO_URI        = os.getenv("MONGO_URI", "")
@@ -216,8 +220,7 @@ class VerifyDB:
     # ── bars 讀寫（語義克隆自 DC database.py）──
     def get_bars(self, ticker: str, period: str) -> List[dict]:
         ticker = ticker.upper()
-        doc = self.stock_db["Bars"].find_one(
-            {"ticker": ticker, "period": period})
+        doc = self.stock_db[dc.BARS].find_one(dc.bars_filter(ticker, period))
         if doc and "bars" in doc:
             return doc["bars"]
         return []
@@ -229,38 +232,28 @@ class VerifyDB:
         防止補抓中段缺口時破壞排序（DC 版假設 new 恆比 existing 新）。
         """
         ticker = ticker.upper()
-        col = self.stock_db["Bars"]
+        col = self.stock_db[dc.BARS]
         col.create_index(
             [("ticker", pymongo.ASCENDING), ("period", pymongo.ASCENDING)],
             unique=True,
         )
-        limit = BARS_LIMIT.get(period, 500)
-        doc = col.find_one({"ticker": ticker, "period": period})
+        limit = BARS_LIMIT.get(period, dc.DEFAULT_BARS_LIMIT)
+        filt = dc.bars_filter(ticker, period)
+        doc = col.find_one(filt)
         if doc:
-            existing = doc.get("bars", [])
-            # 2026-07-25 對齊 DC 止血：按 t 字典合併、同 t 新值覆蓋舊值（新贏），
-            # 避免補抓時把同 t 的新抓值當「已存在」丟棄（權威值被暫定值擋住）+ 不再製造重複。
-            by_t = {b["t"]: b for b in existing}
-            for b in new_bars:
-                by_t[b["t"]] = b
-            merged = sorted(by_t.values(), key=lambda b: b["t"], reverse=True)[:limit]
-            col.update_one(
-                {"ticker": ticker, "period": period},
-                {"$set": {"bars": merged, "updated_at": _now_est()}},
-            )
+            # 2026-08-23 DAL：同 t 新贏合併走 data_core.merge_bars_by_t（皇冠邏輯共享 DC）。
+            merged = dc.merge_bars_by_t(doc.get("bars", []), new_bars, limit)
+            col.update_one(filt, dc.bars_set_update(merged))
             return "updated"
-        col.insert_one({
-            "ticker": ticker, "period": period,
-            "bars": sorted(new_bars, key=lambda b: b["t"], reverse=True)[:limit],
-            "updated_at": _now_est(),
-        })
+        # insert 分支：BC 強制新在前、排序不去重 → data_core.sort_cap_bars。
+        col.insert_one(dc.bars_insert_doc(ticker, period, dc.sort_cap_bars(new_bars, limit)))
         return "inserted"
 
     def replace_bars(self, ticker: str, period: str, bars: List[dict]):
         """整筆覆蓋 bars 陣列（數據品質修正 pass 專用，不走去重合併）。"""
-        self.stock_db["Bars"].update_one(
-            {"ticker": ticker.upper(), "period": period},
-            {"$set": {"bars": bars, "updated_at": _now_est()}},
+        self.stock_db[dc.BARS].update_one(
+            dc.bars_filter(ticker.upper(), period),
+            dc.bars_set_update(bars),
         )
 
     # ── verdict ──
