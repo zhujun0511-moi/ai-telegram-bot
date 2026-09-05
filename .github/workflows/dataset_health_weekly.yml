@@ -1,0 +1,41 @@
+name: Dataset Health Check Weekly
+
+# 每週稽核 DATA_MAP 資料地圖是否與 dataset 實況一致（路徑/退役/未宣告寫入方）
+# + Yahoo(mp_data d.csv) vs TD(Mongo D) 週對帳（補「Yahoo mp_data 無 repo 側驗證」缺口）。
+# 見 dataset_health_check.py / handoff_subsystem_dataset_map.md。有告警 → job 變紅（＝需注意）。
+
+on:
+  schedule:
+    - cron: "0 8 * * 6"     # 每週六 08:00 UTC（盤後、低峰）
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: dataset-health-weekly
+  cancel-in-progress: false
+
+jobs:
+  health:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python 3.9
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.9"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run dataset health check (full)
+        env:
+          MONGO_URI:        ${{ secrets.MONGO_URI }}
+          HF_TOKEN:         ${{ secrets.HF_TOKEN }}
+          HF_REPO_ID:       ${{ secrets.HF_REPO_ID }}
+          PYTHONUNBUFFERED: "1"
+        run: python dataset_health_check.py --full
